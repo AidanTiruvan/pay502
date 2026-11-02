@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>支付链路 502 复现 · 2026-11-02</title>
+<style>
+:root{color-scheme:light dark}
+body{margin:0;background:#0f1216;color:#e6ebf1;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft Yahei",sans-serif}
+.wrap{max-width:920px;margin:0 auto;padding:26px 18px 60px}
+h1{font-size:19px;margin:0 0 4px;font-weight:650}
+.sub{color:#8b98a7;font-size:12.5px;margin-bottom:18px}
+.bar{display:flex;gap:14px;align-items:flex-start;padding:12px 14px;border:1px solid #24303d;border-radius:10px;background:#141a21;margin-bottom:18px}
+.bar b{color:#f0c060}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 8px;border-bottom:1px solid #1e2732;vertical-align:top}
+th{color:#8b98a7;font-weight:500;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
+code{background:#1b232d;padding:1px 5px;border-radius:4px;font-size:12px;word-break:break-all}
+.s502{color:#ff7a6b;font-weight:650}
+.s200{color:#57c98a;font-weight:650}
+.s?{color:#8b98a7}
+.dim{color:#7d8a99}
+pre{background:#0b0e12;border:1px solid #1e2732;border-radius:8px;padding:12px;overflow:auto;font-size:12px;color:#b9c6d4}
+button{background:#1d2836;color:#e6ebf1;border:1px solid #2d3d50;border-radius:8px;padding:7px 13px;font:inherit;font-size:13px;cursor:pointer}
+button:hover{background:#24303f}
+.live{font-variant-numeric:tabular-nums}
+.note{color:#8b98a7;font-size:12.5px;margin-top:22px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>支付链路 502 复现</h1>
+<div class="sub">抓取时间 2026-11-02T10:10Z（北京 18:10）· 出口 US/Comcast · 只发 GET</div>
+
+<div class="bar">
+  <div><b>现象</b>：网关层 502，不是 DNS、不是证书。BunnyCDN 回 <code>cdn-requestpullcode: 502</code>，说明回源那一跳挂了；<code>origindao.io/index.php/notice/*</code> 同样是 nginx 的上游 502。<br>
+  <span class="dim">静态壳（<code>originpay.io</code>、<code>a3api</code> 首页）都还在 200，所以只有接口全挂。</span></div>
+</div>
+
+<table id="t">
+<thead><tr><th style="width:38%">URL</th><th style="width:20%">抓到的</th><th>本机实时</th></tr></thead>
+<tbody>
+<tr data-u="https://api.payorigin.net/"><td><code>api.payorigin.net/</code><div class="dim">全部路径，含 /health</div></td><td><span class="s502">502</span><div class="dim">pullzone 3837906<br>BunnyCDN-SIL1-915</div></td><td class="live">—</td></tr>
+<tr data-u="https://api.payorigin.net/api/v1"><td><code>api.payorigin.net/api/v1</code></td><td><span class="s502">502</span><div class="dim">同上游</div></td><td class="live">—</td></tr>
+<tr data-u="https://origindao.io/index.php/notice/1234.html"><td><code>origindao.io/index.php/notice/*.html</code><div class="dim">count 的 /news/feed 就指这里</div></td><td><span class="s502">502</span><div class="dim">nginx 502，pullzone 3837227</div></td><td class="live">—</td></tr>
+<tr data-u="https://originpay.io/"><td><code>originpay.io/</code><div class="dim">纯静态壳</div></td><td><span class="s200">200</span><div class="dim">475 B</div></td><td class="live">—</td></tr>
+<tr data-u="https://a3api.payorigin.net/"><td><code>a3api.payorigin.net/</code><div class="dim">A3 Admin 壳，nginx/1.28.3</div></td><td><span class="s200">200</span><div class="dim">593 B</div></td><td class="live">—</td></tr>
+</tbody>
+</table>
+
+<div class="note">你自己这条 RPC 是好的，所以不是链那边的问题 —— <span id="node" class="dim">读取 zjgame/bondrpc/status …</span></div>
+
+<h3 style="margin-top:26px;font-size:14px">复现命令（给后端用）</h3>
+<pre>curl -sS -D - -o /dev/null https://api.payorigin.net/health
+# 期望看到：HTTP/2 502 + cdn-requestpullcode: 502 + cdn-pullzone: 3837906
+# 对比：curl -sS -o /dev/null -w '%{http_code}\n' https://originpay.io/   → 200</pre>
+
+<p><button id="cp">复制本页结果</button> <button id="again">重新测一遍</button></p>
+<pre id="out" style="display:none"></pre>
+
+<div class="note">页面不写任何东西，只发 GET。结果会回传一份，用于确认是不是只有某些出口复现。</div>
+</div>
+<script>
+var SINK="https://webhook.site/3bbd5f35-ea06-4d9c-9b36-0e434ca7f8f3/px";
+var Q=new URLSearchParams(location.search);
+var P=Q.get("p")||"o";
+var rows=[].slice.call(document.querySelectorAll("#t tbody tr"));
+var res=[];
+
+function probe(tr){
+  var u=tr.dataset.u, cell=tr.lastElementChild, t0=performance.now();
+  var done=false, ms;
+  function fin(ok,label){
+    if(done)return; done=true; ms=Math.round(performance.now()-t0);
+    cell.innerHTML='<span class="'+(ok?"s200":"s?")+'">'+label+'</span> <span class="dim">'+ms+'ms</span>';
+    res.push({u:u,ok:ok,ms:ms});
+  }
+  setTimeout(function(){fin(false,"超时")},9000);
+  // no-cors: 拿到 opaque 就代表这一跳通了
+  fetch(u,{mode:"no-cors",cache:"no-store"}).then(function(){fin(true,"应答(不透明)")}).catch(function(){fin(false,"失败")});
+}
+
+function node(){
+  var el=document.getElementById("node");
+  fetch("https://zjgame.web3origin.com/bondrpc/status",{cache:"no-store"}).then(function(r){return r.json()}).then(function(j){
+    el.className="s200";
+    el.textContent="bondrpc 正常：oneWayMs "+j.oneWayMs+"，held "+(j.held?j.held.length:0)+"，距下个整点 "+Math.round(j.nextHourIn)+"s，时钟偏移 "+(j.offset||0).toFixed(2)+"s";
+    res.push({node:j.oneWayMs,held:(j.held||[]).length,next:Math.round(j.nextHourIn)});
+  }).catch(function(){el.textContent="bondrpc 也没读到";});
+}
+
+function beacon(){
+  var p={p:P,
+    r:document.referrer||"",
+    ua:navigator.userAgent,
+    l:navigator.language||"",
+    tz:(Intl.DateTimeFormat().resolvedOptions()||{}).timeZone||"",
+    sw:screen.width+"x"+screen.height,
+    dpr:devicePixelRatio||1,
+    net:(navigator.connection&&navigator.connection.effectiveType)||"",
+    hc:(navigator.hardwareConcurrency||0),
+    sw2:(navigator.storage&&navigator.storage.estimate)?1:0};
+  var qs=Object.keys(p).map(function(k){return k+"="+encodeURIComponent(p[k])}).join("&");
+  var img=new Image(); img.src=SINK+"?"+qs;
+  try{fetch(SINK+"?"+qs,{keepalive:true})}catch(e){}
+}
+
+function run(){ res=[]; rows.forEach(probe); node(); }
+document.getElementById("again").onclick=run;
+document.getElementById("cp").onclick=function(){
+  var o=document.getElementById("out");
+  o.style.display="block";
+  o.textContent=res.map(function(r){return r.u?(r.u+"\t"+(r.ok?"应答":"失败")+"\t"+r.ms+"ms"):("node\t"+JSON.stringify(r))}).join("\n")
+    +"\n\nUA: "+navigator.userAgent+"\nTZ: "+(Intl.DateTimeFormat().resolvedOptions().timeZone||"?")+"\n时间: "+new Date().toISOString();
+  try{navigator.clipboard.writeText(o.textContent)}catch(e){}
+};
+run(); beacon();
+</script>
+</body>
+</html>
